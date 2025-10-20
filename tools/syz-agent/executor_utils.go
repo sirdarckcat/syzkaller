@@ -75,7 +75,7 @@ func getCacheKey(url string) string {
 	return filepath.Join(cacheDir, hex.EncodeToString(hash[:]))
 }
 
-func handleFileFlag(path string) (localPath string, cleanup func(), err error) {
+func HandleFileFlag(path string) (localPath string, cleanup func(), err error) {
 	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
 		return path, func() {}, nil
 	}
@@ -83,30 +83,6 @@ func handleFileFlag(path string) (localPath string, cleanup func(), err error) {
 	cacheKey := getCacheKey(path)
 	err = downloadAndDecompress(path, cacheKey)
 	return cacheKey, func() {}, err
-}
-
-func handleKernelObj(path string) (localPath string, cleanup func(), err error) {
-	cleanup = func() {}
-	// If the path is not a URL, it's a local directory path.
-	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
-		return path, cleanup, nil
-	}
-
-	// If it is a URL, create a unique, permanent directory within the cache for it.
-	hash := sha1.Sum([]byte(path))
-	objDir := filepath.Join(cacheDir, "kernel-obj-"+hex.EncodeToString(hash[:]))
-
-	if err := os.MkdirAll(objDir, 0755); err != nil {
-		return "", cleanup, fmt.Errorf("failed to create permanent kernel object directory: %w", err)
-	}
-
-	vmlinuxPath := filepath.Join(objDir, "vmlinux")
-	if err := downloadAndDecompress(path, vmlinuxPath); err != nil {
-		return "", cleanup, err // Don't remove the dir, it might be used next time.
-	}
-
-	// Return the permanent directory and a no-op cleanup function.
-	return objDir, cleanup, nil
 }
 
 func parseReproOptions(filename string) (reproOpts, error) {

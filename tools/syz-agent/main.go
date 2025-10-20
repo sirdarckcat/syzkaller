@@ -141,7 +141,7 @@ func precacheResources() {
 		go func() {
 			defer wg.Done()
 			fmt.Println("Caching disk image...")
-			if _, cleanup, err := handleFileFlag(*flagDiskImage); err != nil {
+			if _, cleanup, err := HandleFileFlag(*flagDiskImage); err != nil {
 				fmt.Printf("Warning: failed to pre-cache disk image: %v\n", err)
 			} else {
 				cleanup()
@@ -155,7 +155,7 @@ func precacheResources() {
 		go func() {
 			defer wg.Done()
 			fmt.Println("Caching kernel bzImage...")
-			if _, cleanup, err := handleFileFlag(*flagKernelBZImage); err != nil {
+			if _, cleanup, err := HandleFileFlag(*flagKernelBZImage); err != nil {
 				fmt.Printf("Warning: failed to pre-cache kernel bzImage: %v\n", err)
 			} else {
 				cleanup()
@@ -169,7 +169,7 @@ func precacheResources() {
 		go func() {
 			defer wg.Done()
 			fmt.Println("Caching vmlinux...")
-			if _, cleanup, err := handleKernelObj(*flagKernelCheckout); err != nil {
+			if _, cleanup, err := HandleFileFlag(*flagKernelCheckout); err != nil {
 				fmt.Printf("Warning: failed to pre-cache kernel checkout/vmlinux: %v\n", err)
 			} else {
 				cleanup()
@@ -263,8 +263,14 @@ func main() {
 	}
 
 	// 4. Compose Agent from different providers
+	kernelObj := *flagKernelCheckout
+	if buildResultChan != nil {
+		// Wait for the build to finish to get the vmlinux path.
+		res := <-buildResultChan
+		kernelObj = res.VmlinuxPath
+	}
 	providers := []ToolProvider{
-		NewCodeExplorer(kernelRepo.Dir),
+		NewCodeExplorer(kernelRepo.Dir, kernelObj),
 		NewCrashContext(crashReport, syzReproducer),
 	}
 

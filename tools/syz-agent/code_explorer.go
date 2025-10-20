@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/genai"
@@ -12,31 +14,33 @@ const maxOutputSize = 500000 // Limit output to 500k characters
 
 // CodeExplorer provides tools for exploring source code.
 type CodeExplorer struct {
-	kernelDir string
+	kernelDir   string
+	kernelObj   string
+	fnProviders []FunctionProvider
 }
 
 // NewCodeExplorer creates a new CodeExplorer.
-func NewCodeExplorer(kernelDir string) *CodeExplorer {
-	return &CodeExplorer{kernelDir: kernelDir}
+func NewCodeExplorer(kernelDir, kernelObj string) *CodeExplorer {
+	return &CodeExplorer{kernelDir: kernelDir, kernelObj: kernelObj}
 }
 
 // GetTools returns the set of tools for code exploration.
 func (ce *CodeExplorer) GetTools() []*Tool {
 	return []*Tool{
-		{
-			Declaration: genai.FunctionDeclaration{
-				Name:        "git_grep",
-				Description: "Performs a text-based search for a string in the kernel source code using 'git grep'. This is useful for finding any mention of a function, variable, or string literal.",
-				Parameters: &genai.Schema{
-					Type: genai.TypeObject,
-					Properties: map[string]*genai.Schema{
-						"search_term": {Type: genai.TypeString, Description: "The text snippet to search for."},
-					},
-					Required: []string{"search_term"},
-				},
-			},
-			Handler: ce.handleGitGrep,
-		},
+		// {
+		// 	Declaration: genai.FunctionDeclaration{
+		// 		Name:        "git_grep",
+		// 		Description: "Performs a text-based search for a string in the kernel source code using 'git grep'. This is useful for finding any mention of a function, variable, or string literal.",
+		// 		Parameters: &genai.Schema{
+		// 			Type: genai.TypeObject,
+		// 			Properties: map[string]*genai.Schema{
+		// 				"search_term": {Type: genai.TypeString, Description: "The text snippet to search for."},
+		// 			},
+		// 			Required: []string{"search_term"},
+		// 		},
+		// 	},
+		// 	Handler: ce.handleGitGrep,
+		// },
 		{
 			Declaration: genai.FunctionDeclaration{
 				Name: "get_function_definition",
@@ -51,6 +55,26 @@ func (ce *CodeExplorer) GetTools() []*Tool {
 				},
 			},
 			Handler: ce.handleGetFunctionDefinition,
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "get_file_lines",
+				Description: "Retrieves content from a specific file within the kernel source tree, limited to a " +
+					"given line range. This is useful for inspecting specific parts of a file.",
+				Parameters: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"file_path": {
+							Type:        genai.TypeString,
+							Description: "The relative path to the file from the root of the kernel source tree.",
+						},
+						"start_line": {Type: genai.TypeInteger, Description: "The starting line number (1-based)."},
+						"end_line":   {Type: genai.TypeInteger, Description: "The ending line number (inclusive)."},
+					},
+					Required: []string{"file_path", "start_line", "end_line"},
+				},
+			},
+			Handler: ce.handleGetFileLines,
 		},
 	}
 }
@@ -71,6 +95,24 @@ func (ce *CodeExplorer) handleGetFunctionDefinition(ts *ToolSet, fc *genai.Funct
 	}
 	output, err := ce.findFunctionDefinition(functionName)
 	return ce.createResponse("get_function_definition", output, err), nil
+}
+
+func (ce *CodeExplorer) handleGetFileLines(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+	filePath, ok := fc.Args["file_path"].(string)
+	if !ok {
+		return nil, fmt.Errorf("agent provided invalid 'file_path' argument type")
+	}
+	// JSON numbers are float64 by default, so we need to cast them.
+	startLine, ok := fc.Args["start_line"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("agent provided invalid 'start_line' argument type")
+	}
+	endLine, ok := fc.Args["end_line"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("agent provided invalid 'end_line' argument type")
+	}
+	output, err := ce.executeGetFileLines(filePath, int(startLine), int(endLine))
+	return ce.createResponse("get_file_lines", output, err), nil
 }
 
 func (ce *CodeExplorer) createResponse(name, output string, err error) *genai.Part {
@@ -103,36 +145,51 @@ func (ce *CodeExplorer) executeGitGrep(searchTerm string) (string, error) {
 }
 
 func (ce *CodeExplorer) findFunctionDefinition(functionName string) (string, error) {
-	// Step 1: Try the fast path with weggli.
-	weggliPattern := fmt.Sprintf("_ %s(){}", functionName)
-	cmdWeggli := exec.Command("weggli", weggliPattern, ".")
-	cmdWeggli.Dir = ce.kernelDir
-	fmt.Printf("Executing command (fast attempt): %s\n", cmdWeggli.String())
-	outputWeggli, errWeggli := cmdWeggli.CombinedOutput()
-
-	if errWeggli == nil && len(strings.TrimSpace(string(outputWeggli))) > 0 {
-		fmt.Println("weggli found a match.")
-		return string(outputWeggli), nil
-	}
-	if errWeggli != nil {
-		fmt.Printf("weggli failed, but continuing to ast-grep. Error: %v\n", errWeggli)
-	} else {
-		fmt.Println("weggli found no matches. Falling back to ast-grep for a more thorough search.")
-	}
-
-	// Step 2: If weggli fails or finds nothing, fall back to the slower but more robust ast-grep.
-	astGrepPattern := fmt.Sprintf("$$$ %s($$$ARGS){$$$}", functionName)
-	cmdAstGrep := exec.Command("ast-grep", "run", "--lang=c", "--pattern", astGrepPattern, "--selector", "function_definition", ".")
-	cmdAstGrep.Dir = ce.kernelDir
-	fmt.Printf("Executing command (fallback): %s\n", cmdAstGrep.String())
-	outputAstGrep, errAstGrep := cmdAstGrep.CombinedOutput()
-	if errAstGrep != nil {
-		if exitErr, ok := errAstGrep.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return "No definition found for that function.", nil
+	if ce.fnProviders == nil {
+		ce.fnProviders = []FunctionProvider{
+			&GoELFProvider{kernelObj: ce.kernelObj, kernelDir: ce.kernelDir},
+			&WeggliProvider{kernelDir: ce.kernelDir},
+			&AstGrepProvider{kernelDir: ce.kernelDir},
 		}
-		return "", fmt.Errorf("ast-grep command failed: %v\nOutput: %s", errAstGrep, string(outputAstGrep))
 	}
-	return string(outputAstGrep), nil
+
+	var lastErr error
+	for _, p := range ce.fnProviders {
+		// The Go provider needs the kernel object path.
+		if _, ok := p.(*GoELFProvider); ok && ce.kernelObj == "" {
+			fmt.Fprintln(os.Stderr, "skipping GoELFProvider: kernel object path not set")
+			continue
+		}
+		output, err := p.FindFunctionDefinition(functionName)
+		if err == nil {
+			return output, nil
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr, "provider failed: %v\n", err)
+	}
+	return "", fmt.Errorf("all function definition providers failed; last error: %w", lastErr)
+}
+
+func (ce *CodeExplorer) executeGetFileLines(filePath string, startLine, endLine int) (string, error) {
+	if startLine <= 0 || endLine < startLine {
+		return "", fmt.Errorf("invalid line range: start %d, end %d", startLine, endLine)
+	}
+
+	fullPath := filepath.Join(ce.kernelDir, filePath)
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file %s: %w", fullPath, err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	if startLine > len(lines) {
+		return "", fmt.Errorf("start line %d is after end of file (%d lines)", startLine, len(lines))
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	return strings.Join(lines[startLine-1:endLine], "\n"), nil
 }
 
 func truncateString(s string, n int) string {

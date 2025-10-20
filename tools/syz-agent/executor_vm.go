@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/google/syzkaller/pkg/csource"
@@ -78,19 +77,19 @@ func (se *SyzExecutor) prepareProgram(progFile, kernelCheckout, kernelBZImage st
 		}
 	}()
 
-	localImage, cleanupImage, err := handleFileFlag(se.cfg.DiskImage)
+	localImage, cleanupImage, err := HandleFileFlag(se.cfg.DiskImage)
 	if err != nil {
 		return nil, nil, err
 	}
 	cleanupGuard(cleanupImage)
 
-	localKernel, cleanupKernel, err := handleFileFlag(kernelBZImage)
+	localKernel, cleanupKernel, err := HandleFileFlag(kernelBZImage)
 	if err != nil {
 		return nil, nil, err
 	}
 	cleanupGuard(cleanupKernel)
 
-	localKernelObjDir, cleanupKernelObj, err := handleKernelObj(kernelCheckout)
+	localKernelObj, cleanupKernelObj, err := HandleFileFlag(kernelCheckout)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -108,14 +107,13 @@ func (se *SyzExecutor) prepareProgram(progFile, kernelCheckout, kernelBZImage st
 		socketFile.Close()
 		os.Remove(gdbSocket)
 
-		vmlinuxPath := filepath.Join(localKernelObjDir, "vmlinux")
 		gdbDetails = &gdbInfo{
 			Socket:  gdbSocket,
-			Command: fmt.Sprintf("gdb %s -ex 'target remote %s'", vmlinuxPath, gdbSocket),
+			Command: fmt.Sprintf("gdb %s -ex 'target remote %s'", localKernelObj, gdbSocket),
 		}
 	}
 
-	cfg, err := se.buildManagerConfig(localKernelObjDir, localImage, localKernel, gdbSocket)
+	cfg, err := se.buildManagerConfig(localKernelObj, localImage, localKernel, gdbSocket)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build manager config: %w", err)
 	}

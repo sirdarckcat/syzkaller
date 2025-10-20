@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -160,7 +159,7 @@ func (se *SyzExecutor) handleObjdump(ts *ToolSet, fc *genai.FunctionCall) (*gena
 		return nil, err
 	}
 
-	kernelObjDir, cleanup, err := handleKernelObj(vmlinuxPath)
+	kernelObj, cleanup, err := HandleFileFlag(vmlinuxPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local kernel object directory: %w", err)
 	}
@@ -179,8 +178,7 @@ func (se *SyzExecutor) handleObjdump(ts *ToolSet, fc *genai.FunctionCall) (*gena
 		"--no-addresses",
 		"--line-numbers",
 		"--section=.text",
-		fmt.Sprintf("--disassemble=%s", symbolName),
-		filepath.Join(kernelObjDir, "vmlinux"),
+		fmt.Sprintf("--disassemble=%s", symbolName), kernelObj,
 	}
 	cmd := exec.Command("objdump", args...)
 
@@ -212,7 +210,7 @@ func (se *SyzExecutor) handlePahole(ts *ToolSet, fc *genai.FunctionCall) (*genai
 		return nil, err
 	}
 
-	kernelObjDir, cleanup, err := handleKernelObj(vmlinuxPath)
+	kernelObj, cleanup, err := HandleFileFlag(vmlinuxPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local kernel object directory: %w", err)
 	}
@@ -223,7 +221,7 @@ func (se *SyzExecutor) handlePahole(ts *ToolSet, fc *genai.FunctionCall) (*genai
 		return nil, fmt.Errorf("agent provided invalid 'name' argument type")
 	}
 
-	args := []string{name, filepath.Join(kernelObjDir, "vmlinux")}
+	args := []string{name, kernelObj}
 	cmd := exec.Command("pahole", args...)
 
 	fmt.Printf("Executing command: %s\n", cmd.String())
