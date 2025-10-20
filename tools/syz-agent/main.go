@@ -190,7 +190,8 @@ func precacheResources() {
 		go func() {
 			defer wg.Done()
 			fmt.Println("Caching vmlinux...")
-			if _, cleanup, err := HandleFileFlag(*flagKernelCheckout); err != nil {
+			// Use handleKernelObj for vmlinux to ensure it's placed in a directory
+			if _, cleanup, err := handleKernelObj(*flagKernelCheckout); err != nil {
 				fmt.Printf("Warning: failed to pre-cache kernel checkout/vmlinux: %v\n", err)
 			} else {
 				cleanup()
@@ -213,6 +214,11 @@ func main() {
 
 	if *flagURL == "" || len(flagPrompts) == 0 || *flagAPIKey == "" {
 		tool.Failf("All --syzkaller-url, --api-key and at least one prompt argument are required")
+	}
+
+	// Ensure the cache directory exists before any caching can occur.
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		tool.Failf("failed to create cache directory: %v", err)
 	}
 
 	precacheResources()
