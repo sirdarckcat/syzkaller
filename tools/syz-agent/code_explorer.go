@@ -27,20 +27,21 @@ func NewCodeExplorer(kernelDir, kernelObj string) *CodeExplorer {
 // GetTools returns the set of tools for code exploration.
 func (ce *CodeExplorer) GetTools() []*Tool {
 	return []*Tool{
-		// {
-		// 	Declaration: genai.FunctionDeclaration{
-		// 		Name:        "git_grep",
-		// 		Description: "Performs a text-based search for a string in the kernel source code using 'git grep'. This is useful for finding any mention of a function, variable, or string literal.",
-		// 		Parameters: &genai.Schema{
-		// 			Type: genai.TypeObject,
-		// 			Properties: map[string]*genai.Schema{
-		// 				"search_term": {Type: genai.TypeString, Description: "The text snippet to search for."},
-		// 			},
-		// 			Required: []string{"search_term"},
-		// 		},
-		// 	},
-		// 	Handler: ce.handleGitGrep,
-		// },
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name:        "git_grep",
+				Description: "Performs a text-based search for a string in the kernel source code using 'git grep'. This is useful for finding any mention of a function, variable, or string literal.",
+				Parameters: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"search_term": {Type: genai.TypeString, Description: "The text snippet to search for."},
+					},
+					Required: []string{"search_term"},
+				},
+			},
+			Handler: ce.handleGitGrep,
+			Classes: []string{"code_explorer"},
+		},
 		{
 			Declaration: genai.FunctionDeclaration{
 				Name: "get_function_definition",
@@ -55,6 +56,7 @@ func (ce *CodeExplorer) GetTools() []*Tool {
 				},
 			},
 			Handler: ce.handleGetFunctionDefinition,
+			Classes: []string{"crash_analyzer", "code_explorer"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -75,6 +77,7 @@ func (ce *CodeExplorer) GetTools() []*Tool {
 				},
 			},
 			Handler: ce.handleGetFileLines,
+			Classes: []string{"crash_analyzer", "code_explorer"},
 		},
 	}
 }

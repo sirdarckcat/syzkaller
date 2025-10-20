@@ -45,8 +45,21 @@ func printToolOutputPreview(toolName, output string) {
 }
 
 // generateContentWithTools manages a stateless conversation with the model, including tool calls.
-func generateContentWithTools(ctx context.Context, client *genai.Client, prompt string, toolSet *ToolSet, history []*genai.Content) (string, []*genai.Content, error) {
-	tools := toolSet.GetToolConfig()
+func generateContentWithTools(ctx context.Context, client *genai.Client, rawPrompt string, toolSet *ToolSet, history []*genai.Content) (string, []*genai.Content, error) {
+	agentClass, prompt := parsePrompt(rawPrompt)
+	var tools *genai.Tool
+	if agentClass != "" {
+		fmt.Printf("--- Using agent class: %s ---\n", agentClass)
+		tools = toolSet.GetToolConfigForClass(agentClass)
+		if tools == nil || len(tools.FunctionDeclarations) == 0 {
+			return "", history, fmt.Errorf("no tools found for agent class '%s'", agentClass)
+		}
+	} else {
+		fmt.Println("--- Using all available tools (no class specified) ---")
+		tools = toolSet.GetToolConfig()
+	}
+
+	fmt.Printf("\n--- Sending prompt to agent: '%s' ---\n", prompt)
 
 	thinkingBudget := int32(-1)
 	config := &genai.GenerateContentConfig{
@@ -62,8 +75,6 @@ func generateContentWithTools(ctx context.Context, client *genai.Client, prompt 
 		Parts: []*genai.Part{{Text: prompt}},
 		Role:  "user",
 	})
-
-	fmt.Printf("\n--- Sending prompt to agent: '%s' ---\n", prompt)
 
 	for {
 		resp, err := client.Models.GenerateContent(ctx, "gemini-2.5-pro", history, config)
@@ -127,6 +138,16 @@ func generateContentWithTools(ctx context.Context, client *genai.Client, prompt 
 
 		return "", nil, fmt.Errorf("model response contained no actionable content (text or function call)")
 	}
+}
+
+// parsePrompt splits a raw prompt into an agent class and the actual prompt.
+// e.g., "code_explorer:find the code of x" -> "code_explorer", "find the code of x"
+func parsePrompt(rawPrompt string) (string, string) {
+	parts := strings.SplitN(rawPrompt, ":", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return "", rawPrompt // No class specified
 }
 
 // precacheResources checks for remote resources and downloads them into the cache at startup.
@@ -297,13 +318,13 @@ func main() {
 
 	// 5. Run Conversation Loop
 	var history []*genai.Content
-	for _, prompt := range flagPrompts {
+	for _, rawPrompt := range flagPrompts {
 		var finalResponse string
-		finalResponse, history, err = generateContentWithTools(ctx, client, prompt, toolSet, history)
+		finalResponse, history, err = generateContentWithTools(ctx, client, rawPrompt, toolSet, history)
 		if err != nil {
-			tool.Failf("Error in agent conversation for prompt '%s': %v", prompt, err)
+			tool.Failf("Error in agent conversation for prompt '%s': %v", rawPrompt, err)
 		}
-
+		_, prompt := parsePrompt(rawPrompt)
 		fmt.Printf("\n--- Agent's Final Response for: '%s' ---\n", prompt)
 		fmt.Println(finalResponse)
 		fmt.Println(strings.Repeat("=", 80))

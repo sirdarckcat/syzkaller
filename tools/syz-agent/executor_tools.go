@@ -65,6 +65,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handleRunSyzProgram,
+			Classes: []string{"crash_analyzer", "syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -83,6 +84,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handlePahole,
+			Classes: []string{"crash_analyzer", "code_explorer", "syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -101,6 +103,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handleObjdump,
+			Classes: []string{"crash_analyzer", "code_explorer", "syzkaller_executor"},
 		},
 	}
 }

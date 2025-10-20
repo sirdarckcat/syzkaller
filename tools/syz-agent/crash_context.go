@@ -30,6 +30,7 @@ func (cc *CrashContext) GetTools() []*Tool {
 				Parameters:  &genai.Schema{Type: genai.TypeObject},
 			},
 			Handler: cc.handleGetCrashContext,
+			Classes: []string{"crash_analyzer"},
 		},
 	}
 }
