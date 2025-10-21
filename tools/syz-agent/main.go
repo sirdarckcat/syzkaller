@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -10,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/syzkaller/pkg/tool"
 	"google.golang.org/genai"
@@ -30,19 +30,6 @@ var (
 	flagKernelBZImage  = flag.String("kernel_bzimage", "", "path to kernel image (e.g., bzImage) or URL")
 	flagDebug          = flag.Bool("debug", false, "enable debug output for VM and executor")
 )
-
-// printToolOutputPreview prints the first 30 lines of a tool's output to the console.
-func printToolOutputPreview(toolName, output string) {
-	fmt.Printf("\n--- Tool Output Preview: %s ---\n", toolName)
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for i := 0; i < 30 && scanner.Scan(); i++ {
-		fmt.Println(scanner.Text())
-	}
-	if scanner.Scan() {
-		fmt.Println("... (output continues)")
-	}
-	fmt.Println("---------------------------------")
-}
 
 // generateContentWithTools manages a stateless conversation with the model, including tool calls.
 func generateContentWithTools(ctx context.Context, client *genai.Client, rawPrompt string, toolSet *ToolSet, history []*genai.Content) (string, []*genai.Content, error) {
@@ -77,9 +64,26 @@ func generateContentWithTools(ctx context.Context, client *genai.Client, rawProm
 	})
 
 	for {
-		resp, err := client.Models.GenerateContent(ctx, "gemini-2.5-pro", history, config)
+		var resp *genai.GenerateContentResponse
+		var err error
+		const maxRetries = 3
+		const initialBackoff = 2 * time.Second
+
+		for i := 0; i < maxRetries; i++ {
+			resp, err = client.Models.GenerateContent(ctx, "gemini-2.5-pro", history, config)
+			if err == nil {
+				break // Success
+			}
+			fmt.Printf("GenAI API call failed (attempt %d/%d): %v\n", i+1, maxRetries, err)
+			if i < maxRetries-1 {
+				backoff := initialBackoff * time.Duration(1<<(i)) // Exponential backoff
+				fmt.Printf("Retrying in %v...\n", backoff)
+				time.Sleep(backoff)
+			}
+		}
+
 		if err != nil {
-			return "", history, fmt.Errorf("failed to generate content: %w", err)
+			return "", history, fmt.Errorf("failed to generate content after %d attempts: %w", maxRetries, err)
 		}
 
 		if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
@@ -299,37 +303,12 @@ func main() {
 	}
 
 	// 4. Compose Agent from different providers
-	kernelObj := *flagKernelCheckout
-	if buildResultChan != nil {
-		// Wait for the build to finish to get the vmlinux path.
-		res := <-buildResultChan
-		kernelObj = res.VmlinuxPath
-	}
-	providers := []ToolProvider{
-		NewCodeExplorer(kernelRepo.Dir, kernelObj),
-		NewCrashContext(crashReport, syzReproducer),
-	}
-
-	if (*flagKernelCheckout != "" && *flagKernelBZImage != "") || *flagBuildKernel {
-		fmt.Println("SyzExecutor enabled.")
-		syzkallerPath, err := os.Getwd()
-		if err != nil {
-			tool.Failf("failed to get current working directory: %v", err)
-		}
-		providers = append(providers, NewSyzExecutor(SyzExecutorConfig{
-			SyzkallerPath:   syzkallerPath,
-			KernelDir:       kernelRepo.Dir,
-			KernelCheckout:  *flagKernelCheckout,
-			DiskImage:       *flagDiskImage,
-			KernelBZImage:   *flagKernelBZImage,
-			Debug:           *flagDebug,
-			BuildResultChan: buildResultChan,
-		}))
-	} else {
-		fmt.Println("SyzExecutor disabled (kernel artifacts not provided and --build-kernel=false).")
-	}
-
-	toolSet := NewToolSet(providers...)
+	toolSet := initializeTools(
+		kernelRepo.Dir,
+		crashReport,
+		syzReproducer,
+		buildResultChan,
+	)
 
 	// 5. Run Conversation Loop
 	var history []*genai.Content
