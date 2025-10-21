@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"debug/dwarf"
 	"debug/elf"
@@ -9,13 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
-// FunctionProvider defines an interface for finding function source code.
+// FunctionProvider defines an interface for code intelligence operations.
 type FunctionProvider interface {
 	// FindFunctionDefinition attempts to find the source code for a given function.
 	FindFunctionDefinition(functionName string) (string, error)
+	// FindFunctionCalls attempts to find all call sites for a given function.
+	FindFunctionCalls(functionName string) (string, error)
 }
 
 // --- GoELFProvider ---
@@ -141,9 +146,20 @@ func (p *GoELFProvider) FindFunctionDefinition(functionName string) (string, err
 			return "", fmt.Errorf("invalid line range for function start: %d (end: %d) for file %s", bodyStartLine+1, endLine, fileName)
 		}
 
+		// Improved logic to find the function signature.
 		signatureLine := -1
-		for i := bodyStartLine; i >= 0; i-- {
-			if strings.Contains(lines[i], functionName) && strings.Contains(lines[i], "(") {
+		searchStart := bodyStartLine - 5
+		if searchStart < 0 {
+			searchStart = 0
+		}
+		// Regex to find the function name as a whole word, followed by an optional space and a parenthesis.
+		re, err := regexp.Compile(`\b` + functionName + `\b\s*\(`)
+		if err != nil {
+			return "", fmt.Errorf("invalid regex for function search: %w", err)
+		}
+
+		for i := bodyStartLine; i >= searchStart; i-- {
+			if re.MatchString(lines[i]) {
 				signatureLine = i
 				break
 			}
@@ -168,9 +184,14 @@ func (p *GoELFProvider) FindFunctionDefinition(functionName string) (string, err
 	return "", fmt.Errorf("function %s not found in DWARF info", functionName)
 }
 
+// FindFunctionCalls is not supported by the GoELFProvider.
+func (p *GoELFProvider) FindFunctionCalls(functionName string) (string, error) {
+	return "", fmt.Errorf("finding function calls is not supported by the ELF/DWARF provider")
+}
+
 // --- WeggliProvider ---
 
-// WeggliProvider uses weggli to find function definitions.
+// WeggliProvider uses weggli to find function definitions and calls.
 type WeggliProvider struct {
 	kernelDir string
 }
@@ -181,17 +202,31 @@ func (p *WeggliProvider) FindFunctionDefinition(functionName string) (string, er
 	cmd := exec.Command("weggli", "--after=9999999", weggliPattern, p.kernelDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("weggli command failed: %w\nOutput: %s", err, string(output))
+		return "", fmt.Errorf("weggli definition command failed: %w\nOutput: %s", err, string(output))
 	}
 	if len(bytes.TrimSpace(output)) == 0 {
-		return "", fmt.Errorf("weggli found no matches")
+		return "", fmt.Errorf("weggli found no definition")
+	}
+	return string(output), nil
+}
+
+// FindFunctionCalls finds all call sites for a function using weggli.
+func (p *WeggliProvider) FindFunctionCalls(functionName string) (string, error) {
+	weggliPattern := fmt.Sprintf("%s();", functionName)
+	cmd := exec.Command("weggli", "-A0", "-B0", weggliPattern, p.kernelDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("weggli calls command failed: %w\nOutput: %s", err, string(output))
+	}
+	if len(bytes.TrimSpace(output)) == 0 {
+		return "", fmt.Errorf("weggli found no calls")
 	}
 	return string(output), nil
 }
 
 // --- AstGrepProvider ---
 
-// AstGrepProvider uses ast-grep to find function definitions.
+// AstGrepProvider uses ast-grep to find function definitions and calls.
 type AstGrepProvider struct {
 	kernelDir string
 }
@@ -203,10 +238,108 @@ func (p *AstGrepProvider) FindFunctionDefinition(functionName string) (string, e
 	cmd.Dir = p.kernelDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("ast-grep command failed: %w\nOutput: %s", err, string(output))
+		return "", fmt.Errorf("ast-grep definition command failed: %w\nOutput: %s", err, string(output))
 	}
 	if len(bytes.TrimSpace(output)) == 0 {
-		return "", fmt.Errorf("ast-grep found no matches")
+		return "", fmt.Errorf("ast-grep found no definition")
+	}
+	return string(output), nil
+}
+
+// FindFunctionCalls finds all call sites for a function using ast-grep.
+func (p *AstGrepProvider) FindFunctionCalls(functionName string) (string, error) {
+	astGrepPattern := fmt.Sprintf("%s($$$)", functionName)
+	cmd := exec.Command("ast-grep", "run", "--lang=c", "--pattern", astGrepPattern, "--selector", "call_expression", p.kernelDir)
+	cmd.Dir = p.kernelDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ast-grep calls command failed: %w\nOutput: %s", err, string(output))
+	}
+	if len(bytes.TrimSpace(output)) == 0 {
+		return "", fmt.Errorf("ast-grep found no calls")
+	}
+	return string(output), nil
+}
+
+// --- CscopeProvider ---
+
+// CscopeProvider uses cscope to find function definitions and calls.
+type CscopeProvider struct {
+	kernelDir string
+}
+
+// NewCscopeProvider creates a new CscopeProvider and builds the cscope database.
+func NewCscopeProvider(kernelDir string) (*CscopeProvider, error) {
+	fmt.Println("--- Building cscope database... ---")
+	cmd := exec.Command("cscope", "-b", "-q", "-k", "-R")
+	cmd.Dir = kernelDir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("cscope database build failed: %w\nOutput: %s", err, string(output))
+	}
+	fmt.Println("--- cscope database built successfully. ---")
+	return &CscopeProvider{kernelDir: kernelDir}, nil
+}
+
+// FindFunctionDefinition finds a function's source code using the cscope tool.
+func (p *CscopeProvider) FindFunctionDefinition(functionName string) (string, error) {
+	cmd := exec.Command("cscope", "-d", "-L1", functionName)
+	cmd.Dir = p.kernelDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("cscope definition query failed: %w\nOutput: %s", err, string(output))
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output))
+	if !scanner.Scan() {
+		return "", fmt.Errorf("cscope found no definition for function '%s'", functionName)
+	}
+	line := scanner.Text()
+
+	parts := strings.SplitN(line, " ", 4)
+	if len(parts) < 3 {
+		return "", fmt.Errorf("failed to parse cscope output: %s", line)
+	}
+	filePath := parts[0]
+	startLineNum, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return "", fmt.Errorf("failed to parse line number from cscope output: %w", err)
+	}
+
+	fullPath := filepath.Join(p.kernelDir, filePath)
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read source file %s: %w", fullPath, err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	if startLineNum > len(lines) {
+		return "", fmt.Errorf("cscope line number %d is out of bounds for file %s", startLineNum, filePath)
+	}
+
+	endLineNum := -1
+	for i := startLineNum - 1; i < len(lines); i++ {
+		if lines[i] == "}" {
+			endLineNum = i + 1
+			break
+		}
+	}
+	if endLineNum == -1 {
+		endLineNum = len(lines)
+	}
+
+	return strings.Join(lines[startLineNum-1:endLineNum], "\n"), nil
+}
+
+// FindFunctionCalls finds all call sites for a function using cscope.
+func (p *CscopeProvider) FindFunctionCalls(functionName string) (string, error) {
+	cmd := exec.Command("cscope", "-d", "-L3", functionName)
+	cmd.Dir = p.kernelDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("cscope call query failed: %w\nOutput: %s", err, string(output))
+	}
+	if len(bytes.TrimSpace(output)) == 0 {
+		return "", fmt.Errorf("cscope found no calls for function '%s'", functionName)
 	}
 	return string(output), nil
 }

@@ -272,7 +272,7 @@ func (e *Executor) GdbSyzProgram(syzProgram string) (string, error) {
 			log.Logf(0, "failed to continue gdb in gdb_syz_program: %v", err)
 			return
 		}
-		_, err := e.activeHandle.execInst.RunSyzProgFile(progFile.Name(), 5*time.Minute, csOpts, instance.SyzExitConditions)
+		_, err := e.activeHandle.execInst.RunSyzProgFile(progFile.Name(), 2*time.Minute, csOpts, instance.SyzExitConditions)
 		if err != nil {
 			log.Logf(0, "syz program execution failed in gdb_syz_program: %v", err)
 		}
@@ -288,8 +288,8 @@ func (e *Executor) GdbSyzProgram(syzProgram string) (string, error) {
 			return "", fmt.Errorf("failed to marshal notifications: %w", err)
 		}
 		return string(jsonOutput), nil
-	case <-time.After(5 * time.Minute):
-		return "", fmt.Errorf("timed out after 5 minutes of waiting for a GDB 'stopped' notification")
+	case <-time.After(2 * time.Minute):
+		return "", fmt.Errorf("timed out after 2 minutes of waiting for a GDB 'stopped' notification")
 	}
 }
 

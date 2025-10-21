@@ -96,22 +96,25 @@ func (ts *ToolSet) Handle(fc *genai.FunctionCall) (*genai.Part, error) {
 
 // Tools provides a unified set of tools for the agent.
 type Tools struct {
-	kernelDir   string
-	kernelObj   string
-	report      string
-	reproducer  string
-	fnProviders []FunctionProvider
-	executor    *Executor
+	kernelDir       string
+	kernelObj       string
+	report          string
+	reproducer      string
+	fnProviders     []FunctionProvider
+	cscopeProvider  *CscopeProvider
+	cscopeReadyChan <-chan *CscopeProvider
+	executor        *Executor
 }
 
 // NewTools creates a new Tools provider.
-func NewTools(kernelDir, kernelObj, report, reproducer string, executor *Executor) *Tools {
+func NewTools(kernelDir, kernelObj, report, reproducer string, executor *Executor, cscopeReadyChan <-chan *CscopeProvider) *Tools {
 	return &Tools{
-		kernelDir:  kernelDir,
-		kernelObj:  kernelObj,
-		report:     report,
-		reproducer: reproducer,
-		executor:   executor,
+		kernelDir:       kernelDir,
+		kernelObj:       kernelObj,
+		report:          report,
+		reproducer:      reproducer,
+		executor:        executor,
+		cscopeReadyChan: cscopeReadyChan,
 	}
 }
 
@@ -137,6 +140,14 @@ func (at *Tools) GetTools() []*Tool {
 				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"function_name": {Type: genai.TypeString, Description: "The name of the function to find."}}, Required: []string{"function_name"}},
 			},
 			Handler: at.handleGetFunctionDefinition,
+			Classes: []string{"crash_analyzer", "code_explorer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "find_function_calls", Description: "Finds all call sites for a given C function in the kernel source code.",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"function_name": {Type: genai.TypeString, Description: "The name of the function to find calls for."}}, Required: []string{"function_name"}},
+			},
+			Handler: at.handleFindFunctionCalls,
 			Classes: []string{"crash_analyzer", "code_explorer"},
 		},
 		{
@@ -243,6 +254,12 @@ func (at *Tools) handleGetFunctionDefinition(ts *ToolSet, fc *genai.FunctionCall
 	return at.createResponse("get_function_definition", output, err), nil
 }
 
+func (at *Tools) handleFindFunctionCalls(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+	functionName, _ := fc.Args["function_name"].(string)
+	output, err := at.findFunctionCalls(functionName)
+	return at.createResponse("find_function_calls", output, err), nil
+}
+
 func (at *Tools) handleGetFileLines(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	filePath, _ := fc.Args["file_path"].(string)
 	startLine, _ := fc.Args["start_line"].(float64)
@@ -315,14 +332,42 @@ func (at *Tools) executeGitGrep(searchTerm string) (string, error) {
 	return string(output), nil
 }
 
+func (at *Tools) checkCscope() {
+	if at.cscopeProvider == nil {
+		select {
+		case provider, ok := <-at.cscopeReadyChan:
+			if ok && provider != nil {
+				fmt.Println("--- Cscope provider is now ready. ---")
+				at.cscopeProvider = provider
+			}
+		default:
+			// Cscope is not ready, do nothing.
+		}
+	}
+}
+
 func (at *Tools) findFunctionDefinition(functionName string) (string, error) {
+	at.checkCscope()
+
+	// If cscope is ready, it's the preferred provider.
+	if at.cscopeProvider != nil {
+		output, err := at.cscopeProvider.FindFunctionDefinition(functionName)
+		if err == nil {
+			return output, nil
+		}
+		fmt.Fprintf(os.Stderr, "cscope provider failed, trying fallbacks: %v\n", err)
+	}
+
+	// Initialize fallback providers if they don't exist.
 	if at.fnProviders == nil {
 		at.fnProviders = []FunctionProvider{
-			&GoELFProvider{kernelObj: at.kernelObj, kernelDir: at.kernelDir},
 			&WeggliProvider{kernelDir: at.kernelDir},
+			&GoELFProvider{kernelObj: at.kernelObj, kernelDir: at.kernelDir},
 			&AstGrepProvider{kernelDir: at.kernelDir},
 		}
 	}
+
+	// Try the fallback providers.
 	var lastErr error
 	for _, p := range at.fnProviders {
 		if _, ok := p.(*GoELFProvider); ok && at.kernelObj == "" {
@@ -334,7 +379,42 @@ func (at *Tools) findFunctionDefinition(functionName string) (string, error) {
 		}
 		lastErr = err
 	}
+
 	return "", fmt.Errorf("all function definition providers failed; last error: %w", lastErr)
+}
+
+func (at *Tools) findFunctionCalls(functionName string) (string, error) {
+	at.checkCscope()
+
+	// If cscope is ready, it's the preferred provider.
+	if at.cscopeProvider != nil {
+		output, err := at.cscopeProvider.FindFunctionCalls(functionName)
+		if err == nil {
+			return output, nil
+		}
+		fmt.Fprintf(os.Stderr, "cscope provider failed for calls, trying fallbacks: %v\n", err)
+	}
+
+	// Initialize fallback providers if they don't exist.
+	if at.fnProviders == nil {
+		at.fnProviders = []FunctionProvider{
+			&WeggliProvider{kernelDir: at.kernelDir},
+			&GoELFProvider{kernelObj: at.kernelObj, kernelDir: at.kernelDir},
+			&AstGrepProvider{kernelDir: at.kernelDir},
+		}
+	}
+
+	// Try the fallback providers.
+	var lastErr error
+	for _, p := range at.fnProviders {
+		output, err := p.FindFunctionCalls(functionName)
+		if err == nil {
+			return output, nil
+		}
+		lastErr = err
+	}
+
+	return "", fmt.Errorf("all function call providers failed; last error: %w", lastErr)
 }
 
 func (at *Tools) executeGetFileLines(filePath string, startLine, endLine int) (string, error) {
@@ -366,7 +446,7 @@ func truncateString(s string, n int) string {
 // --- Tool Initialization ---
 
 // initializeTools creates and configures all the tool providers for the agent.
-func initializeTools(kernelDir, crashReport, syzReproducer string, buildResultChan chan *BuildResult) *ToolSet {
+func initializeTools(kernelDir, crashReport, syzReproducer string, buildResultChan chan *BuildResult, cscopeReadyChan <-chan *CscopeProvider) *ToolSet {
 	kernelObj := *flagKernelCheckout
 	if buildResultChan != nil {
 		res := <-buildResultChan
@@ -398,6 +478,6 @@ func initializeTools(kernelDir, crashReport, syzReproducer string, buildResultCh
 		fmt.Println("Executor disabled (kernel artifacts not provided and --build-kernel=false).")
 	}
 
-	toolProvider := NewTools(kernelDir, kernelObj, crashReport, syzReproducer, executor)
+	toolProvider := NewTools(kernelDir, kernelObj, crashReport, syzReproducer, executor, cscopeReadyChan)
 	return NewToolSet(toolProvider)
 }

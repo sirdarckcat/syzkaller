@@ -108,6 +108,18 @@ func main() {
 	}
 	fmt.Printf("\nSuccess! Kernel is ready at: %s\n", kernelRepo.Dir)
 
+	// Asynchronously build the cscope database.
+	cscopeReadyChan := make(chan *CscopeProvider, 1)
+	go func() {
+		defer close(cscopeReadyChan)
+		provider, err := NewCscopeProvider(kernelRepo.Dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Async cscope build failed: %v\n", err)
+			return
+		}
+		cscopeReadyChan <- provider
+	}()
+
 	var buildResultChan chan *BuildResult
 	if *flagBuildKernel {
 		buildResultChan = make(chan *BuildResult, 1)
@@ -124,7 +136,7 @@ func main() {
 		tool.Failf("Failed to create GenAI client: %v", err)
 	}
 
-	toolSet := initializeTools(kernelRepo.Dir, crashReport, syzReproducer, buildResultChan)
+	toolSet := initializeTools(kernelRepo.Dir, crashReport, syzReproducer, buildResultChan, cscopeReadyChan)
 	agent := NewAgent(client, toolSet)
 
 	for _, rawPrompt := range flagPrompts {
