@@ -16,12 +16,23 @@ import (
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/ulikunitz/xz"
+	"google.golang.org/genai"
 )
 
 const cacheDir = "/tmp/syz-run-cache"
 
 // reproOpts represents the options extracted from a .syz file's comments.
 type reproOpts map[string]interface{}
+
+// logFunctionCall prints the details of a function call to the console.
+func logFunctionCall(name string, fc *genai.FunctionCall) {
+	args, err := json.MarshalIndent(fc.Args, "", "  ")
+	if err != nil {
+		fmt.Printf("--- Calling %s (failed to marshal args: %v) ---\n", name, err)
+		return
+	}
+	fmt.Printf("--- Calling %s with args ---\n%s\n---------------------------\n", name, string(args))
+}
 
 // downloadAndDecompress fetches a file from a URL and decompresses it if needed.
 func downloadAndDecompress(url, destPath string) error {
@@ -88,9 +99,9 @@ func HandleFileFlag(path string) (localPath string, cleanup func(), err error) {
 	return cachePath, func() {}, err
 }
 
-// handleKernelObj is a special version of HandleFileFlag for the kernel object (vmlinux).
+// HandleKernelObj is a special version of HandleFileFlag for the kernel object (vmlinux).
 // It ensures the downloaded file is placed in a stable directory.
-func handleKernelObj(path string) (localPath string, cleanup func(), err error) {
+func HandleKernelObj(path string) (localPath string, cleanup func(), err error) {
 	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
 		return path, func() {}, nil
 	}
