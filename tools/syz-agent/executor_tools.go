@@ -84,7 +84,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 		{
 			Declaration: genai.FunctionDeclaration{
 				Name: "run_syz_program",
-				Description: "Executes a syzkaller program in the currently running VM. This tool runs in the background. " +
+				Description: "Executes a syzkaller program in the currently running VM. " +
 					"A VM session must be opened first with 'open_vm_session'.",
 				Parameters: &genai.Schema{
 					Type: genai.TypeObject,
@@ -98,31 +98,31 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handleRunSyzProgram,
-			Classes: []string{"crash_analyzer", "syzkaller_executor"},
+			Classes: []string{"syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
 				Name:        "gdb_syz_program",
-				Description: "Executes a syzkaller program and waits for a GDB breakpoint or crash, returning all GDB notifications.",
+				Description: "Executes a syzkaller program (defines syzkalls to run) in the currently running VM and waits for a GDB breakpoint or crash, returning all GDB notifications.",
 				Parameters: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
 						"syz_program": {
 							Type:        genai.TypeString,
-							Description: "The full content of the .syz syzkaller program to execute.",
+							Description: "The full content of the .syz syzkaller program to execute (using the Syzkaller fuzzer DSL).",
 						},
 					},
 					Required: []string{"syz_program"},
 				},
 			},
 			Handler: se.handleGdbSyzProgram,
-			Classes: []string{"crash_analyzer", "syzkaller_executor"},
+			Classes: []string{"syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
 				Name: "gdb_command",
 				Description: "Executes a command in the active GDB session using the MI 'interpreter-exec' command. " +
-					"A session must be started with 'open_vm_session'. Key commands include 'continue', 'bt', 'info registers'.",
+					"A session must be started with 'open_vm_session'. Key commands include 'continue', 'bt', 'info registers', 'break'.",
 				Parameters: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
@@ -135,7 +135,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handleGdbCommand,
-			Classes: []string{"crash_analyzer", "syzkaller_executor"},
+			Classes: []string{"syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -144,7 +144,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				Parameters:  &genai.Schema{Type: genai.TypeObject},
 			},
 			Handler: se.handleGdbLog,
-			Classes: []string{"syzkaller_executor", "crash_analyzer"},
+			Classes: []string{"syzkaller_executor"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -191,7 +191,7 @@ func (se *SyzExecutor) GetTools() []*Tool {
 				},
 			},
 			Handler: se.handleObjdump,
-			Classes: []string{"crash_analyzer", "code_explorer", "syzkaller_executor"},
+			Classes: []string{"code_explorer", "syzkaller_executor"},
 		},
 	}
 }

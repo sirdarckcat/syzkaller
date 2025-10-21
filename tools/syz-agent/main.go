@@ -136,6 +136,15 @@ func generateContentWithTools(ctx context.Context, client *genai.Client, rawProm
 			return finalAnswer, history, nil // The conversation is finished
 		}
 
+		if *flagDebug {
+			jsonResp, jsonErr := json.MarshalIndent(resp, "", "  ")
+			if jsonErr != nil {
+				fmt.Printf("--- DEBUG: Failed to marshal response to JSON: %v ---\n", jsonErr)
+				fmt.Printf("--- DEBUG: Raw Response: %+v ---\n", resp)
+			} else {
+				fmt.Printf("--- DEBUG: Not possible to proceed from current state ---\n%s\n----------------------------------------------------------\n", string(jsonResp))
+			}
+		}
 		return "", nil, fmt.Errorf("model response contained no actionable content (text or function call)")
 	}
 }

@@ -205,7 +205,7 @@ type WeggliProvider struct {
 
 func (p *WeggliProvider) FindFunctionDefinition(functionName string) (string, error) {
 	weggliPattern := fmt.Sprintf("_ %s(){}", functionName)
-	cmd := exec.Command("weggli", weggliPattern, p.kernelDir)
+	cmd := exec.Command("weggli", "--after=9999999", weggliPattern, p.kernelDir)
 	fmt.Printf("Executing command (weggli): %s\n", cmd.String())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
