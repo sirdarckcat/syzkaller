@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -100,7 +101,11 @@ func (a *Agent) generateWithRetry(ctx context.Context) (*genai.GenerateContentRe
 // It returns the final answer (if found), a boolean indicating if the loop should continue, and an error.
 func (a *Agent) processResponse(resp *genai.GenerateContentResponse) (string, bool, error) {
 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
-		return "", false, fmt.Errorf("received empty or invalid response from model")
+		responseBytes, err := json.MarshalIndent(resp, "", "  ")
+		if err != nil {
+			return "", false, fmt.Errorf("received empty or invalid response from model, and failed to marshal it for debugging: %w", err)
+		}
+		return "", false, fmt.Errorf("received empty or invalid response from model. Full response:\n%s", string(responseBytes))
 	}
 
 	modelResponse := resp.Candidates[0].Content
@@ -139,7 +144,12 @@ func (a *Agent) processResponse(resp *genai.GenerateContentResponse) (string, bo
 		return finalAnswer, false, nil // Conversation finished.
 	}
 
-	return "", false, fmt.Errorf("model response contained no actionable content")
+	// If we get here, the model returned neither a tool call nor text.
+	responseBytes, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", false, fmt.Errorf("model response contained no actionable content and failed to marshal for debugging: %w", err)
+	}
+	return "", false, fmt.Errorf("model response contained no actionable content. Full response:\n%s", string(responseBytes))
 }
 
 func parsePrompt(rawPrompt string) (string, string) {

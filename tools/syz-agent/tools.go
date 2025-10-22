@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/genai"
 )
@@ -162,6 +163,22 @@ func (at *Tools) GetTools() []*Tool {
 			Handler: at.handleGetFileLines,
 			Classes: []string{"crash_analyzer", "code_explorer"},
 		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "pahole", Description: "Inspects a kernel data structure's layout using 'pahole'.",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"name": {Type: genai.TypeString, Description: "The name of the class or struct to inspect."}}, Required: []string{"name"}},
+			},
+			Handler: at.handlePahole,
+			Classes: []string{"crash_analyzer", "code_explorer", "executor"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "objdump", Description: "Gets the interleaved C source and assembly for a function or symbol.",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"symbol_name": {Type: genai.TypeString, Description: "The name of the function or symbol to disassemble."}}, Required: []string{"symbol_name"}},
+			},
+			Handler: at.handleObjdump,
+			Classes: []string{"code_explorer", "executor"},
+		},
 	}
 
 	if at.executor != nil {
@@ -174,7 +191,10 @@ func (at *Tools) GetTools() []*Tool {
 			{
 				Declaration: genai.FunctionDeclaration{
 					Name: "run_syz_program", Description: "Executes a syzkaller program in the currently running VM.",
-					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"syz_program": {Type: genai.TypeString, Description: "The full content of the .syz syzkaller program to execute."}}, Required: []string{"syz_program"}},
+					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+						"syz_program":     {Type: genai.TypeString, Description: "The full content of the .syz syzkaller program to execute."},
+						"timeout_seconds": {Type: genai.TypeInteger, Description: "Optional. The timeout in seconds to run the program for. Defaults to 300."},
+					}, Required: []string{"syz_program"}},
 				},
 				Handler: at.handleRunSyzProgram,
 				Classes: []string{"executor"},
@@ -182,7 +202,10 @@ func (at *Tools) GetTools() []*Tool {
 			{
 				Declaration: genai.FunctionDeclaration{
 					Name: "gdb_syz_program", Description: "Executes a syzkaller program and waits for a GDB breakpoint or crash.",
-					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"syz_program": {Type: genai.TypeString, Description: "The full content of the .syz syzkaller program to execute."}}, Required: []string{"syz_program"}},
+					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+						"syz_program":     {Type: genai.TypeString, Description: "The full content of the .syz syzkaller program to execute."},
+						"timeout_seconds": {Type: genai.TypeInteger, Description: "Optional. The timeout in seconds to wait for a GDB event. Defaults to 120."},
+					}, Required: []string{"syz_program"}},
 				},
 				Handler: at.handleGdbSyzProgram,
 				Classes: []string{"executor"},
@@ -190,7 +213,10 @@ func (at *Tools) GetTools() []*Tool {
 			{
 				Declaration: genai.FunctionDeclaration{
 					Name: "gdb_command", Description: "Executes a command in the active GDB session.",
-					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"command": {Type: genai.TypeString, Description: "The GDB console command to execute."}}, Required: []string{"command"}},
+					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+						"command":         {Type: genai.TypeString, Description: "The GDB console command to execute."},
+						"timeout_seconds": {Type: genai.TypeInteger, Description: "Optional. The timeout in seconds for the command. Defaults to 60."},
+					}, Required: []string{"command"}},
 				},
 				Handler: at.handleGdbCommand,
 				Classes: []string{"executor"},
@@ -204,22 +230,6 @@ func (at *Tools) GetTools() []*Tool {
 				Declaration: genai.FunctionDeclaration{Name: "close_vm_session", Description: "Closes the currently running VM and its associated GDB session.", Parameters: &genai.Schema{Type: genai.TypeObject}},
 				Handler:     at.handleCloseVMSession,
 				Classes:     []string{"executor"},
-			},
-			{
-				Declaration: genai.FunctionDeclaration{
-					Name: "pahole", Description: "Inspects a kernel data structure's layout using 'pahole'.",
-					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"name": {Type: genai.TypeString, Description: "The name of the class or struct to inspect."}}, Required: []string{"name"}},
-				},
-				Handler: at.handlePahole,
-				Classes: []string{"crash_analyzer", "code_explorer", "executor"},
-			},
-			{
-				Declaration: genai.FunctionDeclaration{
-					Name: "objdump", Description: "Gets the interleaved C source and assembly for a function or symbol.",
-					Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"symbol_name": {Type: genai.TypeString, Description: "The name of the function or symbol to disassemble."}}, Required: []string{"symbol_name"}},
-				},
-				Handler: at.handleObjdump,
-				Classes: []string{"code_explorer", "executor"},
 			},
 		}
 		tools = append(tools, executorTools...)
@@ -275,19 +285,34 @@ func (at *Tools) handleOpenVMSession(ts *ToolSet, fc *genai.FunctionCall) (*gena
 
 func (at *Tools) handleRunSyzProgram(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	syzProgram, _ := fc.Args["syz_program"].(string)
-	output, err := at.executor.RunSyzProgram(syzProgram)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 300 // Default to 5 minutes
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	output, err := at.executor.RunSyzProgram(syzProgram, timeout)
 	return at.createResponse("run_syz_program", output, err), nil
 }
 
 func (at *Tools) handleGdbSyzProgram(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	syzProgram, _ := fc.Args["syz_program"].(string)
-	output, err := at.executor.GdbSyzProgram(syzProgram)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 120 // Default to 2 minutes
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	output, err := at.executor.GdbSyzProgram(syzProgram, timeout)
 	return at.createResponse("gdb_syz_program", output, err), nil
 }
 
 func (at *Tools) handleGdbCommand(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	command, _ := fc.Args["command"].(string)
-	output, err := at.executor.GdbCommand(command)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 60 // Default to 1 minute
+	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	output, err := at.executor.GdbCommand(command, timeout)
 	return at.createResponse("gdb_command", output, err), nil
 }
 
@@ -309,13 +334,13 @@ func (at *Tools) handleCloseVMSession(ts *ToolSet, fc *genai.FunctionCall) (*gen
 
 func (at *Tools) handlePahole(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	name, _ := fc.Args["name"].(string)
-	output, err := at.executor.Pahole(name)
+	output, err := at.executePahole(name)
 	return at.createResponse("pahole", output, err), nil
 }
 
 func (at *Tools) handleObjdump(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
 	symbolName, _ := fc.Args["symbol_name"].(string)
-	output, err := at.executor.Objdump(symbolName)
+	output, err := at.executeObjdump(symbolName)
 	return at.createResponse("objdump", output, err), nil
 }
 
@@ -328,6 +353,45 @@ func (at *Tools) executeGitGrep(searchTerm string) (string, error) {
 			return "No matches found.", nil
 		}
 		return "", fmt.Errorf("git grep command failed: %v\nOutput: %s", err, string(output))
+	}
+	return string(output), nil
+}
+
+func (at *Tools) executePahole(name string) (string, error) {
+	if at.kernelObj == "" {
+		return "", fmt.Errorf("vmlinux path is not available, cannot run pahole. Please specify --kernel_checkout or use --build-kernel")
+	}
+	kernelObj, cleanup, err := HandleFileFlag(at.kernelObj)
+	if err != nil {
+		return "", fmt.Errorf("failed to get local kernel object directory: %w", err)
+	}
+	defer cleanup()
+	cmd := exec.Command("pahole", name, kernelObj)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("pahole command failed: %v\nOutput: %s", err, string(output))
+	}
+	return string(output), nil
+}
+
+func (at *Tools) executeObjdump(symbolName string) (string, error) {
+	if at.kernelObj == "" {
+		return "", fmt.Errorf("vmlinux path is not available, cannot run objdump. Please specify --kernel_checkout or use --build-kernel")
+	}
+	kernelObj, cleanup, err := HandleFileFlag(at.kernelObj)
+	if err != nil {
+		return "", fmt.Errorf("failed to get local kernel object directory: %w", err)
+	}
+	defer cleanup()
+	args := []string{
+		"--source-comment=/*C*/", "--prefix=" + at.kernelDir, "--prefix-strip=4",
+		"--no-show-raw-insn", "--no-addresses", "--line-numbers", "--section=.text",
+		fmt.Sprintf("--disassemble=%s", symbolName), kernelObj,
+	}
+	cmd := exec.Command("objdump", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("objdump command failed: %v\nOutput: %s", err, string(output))
 	}
 	return string(output), nil
 }

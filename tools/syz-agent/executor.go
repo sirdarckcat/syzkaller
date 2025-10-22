@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/cyrus-and/gdb"
+	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -150,8 +150,8 @@ func (e *Executor) OpenVMSession() (string, error) {
 	return "The VM finished booting. It is now possible to use `gdb_command` or run a syzkaller program.", nil
 }
 
-// GdbCommand executes a command in the active GDB session.
-func (e *Executor) GdbCommand(command string) (string, error) {
+// GdbCommand executes a command in the active GDB session with a timeout.
+func (e *Executor) GdbCommand(command string, timeout time.Duration) (string, error) {
 	if e.activeHandle == nil || e.activeHandle.gdbInst == nil {
 		return "", fmt.Errorf("no active GDB session. Please use 'open_vm_session' first")
 	}
@@ -161,22 +161,45 @@ func (e *Executor) GdbCommand(command string) (string, error) {
 	e.activeHandle.cmdNotifications = nil
 	e.activeHandle.mu.Unlock()
 
-	result, err := e.activeHandle.gdbInst.Send("interpreter-exec", "console", command)
+	defer func() {
+		e.activeHandle.mu.Lock()
+		e.activeHandle.isCapturingForCmd = false
+		e.activeHandle.mu.Unlock()
+	}()
 
-	e.activeHandle.mu.Lock()
-	e.activeHandle.isCapturingForCmd = false
-	notifications := e.activeHandle.cmdNotifications
-	e.activeHandle.mu.Unlock()
+	type gdbResult struct {
+		result map[string]interface{}
+		err    error
+	}
+	resultChan := make(chan gdbResult, 1)
 
-	if err != nil {
-		return "", fmt.Errorf("failed to execute GDB command '%s': %w", command, err)
+	go func() {
+		result, err := e.activeHandle.gdbInst.Send("interpreter-exec", "console", command)
+		resultChan <- gdbResult{result: result, err: err}
+	}()
+
+	select {
+	case res := <-resultChan:
+		if res.err != nil {
+			return "", fmt.Errorf("failed to execute GDB command '%s': %w", command, res.err)
+		}
+		e.activeHandle.mu.Lock()
+		notifications := e.activeHandle.cmdNotifications
+		e.activeHandle.mu.Unlock()
+
+		response := map[string]any{"result": res.result, "notifications": notifications}
+		jsonOutput, err := json.MarshalIndent(response, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal gdb output: %w", err)
+		}
+		return string(jsonOutput), nil
+	case <-time.After(timeout):
+		if err := e.activeHandle.gdbInst.Interrupt(); err != nil {
+			// Log the error but don't fail the entire operation, as the timeout is the primary error.
+			log.Logf(0, "failed to send interrupt to GDB after command timeout: %v", err)
+		}
+		return "", fmt.Errorf("gdb command '%s' timed out after %v. An interrupt was sent to GDB to attempt recovery", command, timeout)
 	}
-	response := map[string]any{"result": result, "notifications": notifications}
-	jsonOutput, err := json.MarshalIndent(response, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal gdb output: %w", err)
-	}
-	return string(jsonOutput), nil
 }
 
 // GdbLog returns the log of all GDB notifications received during the current session.
@@ -195,102 +218,130 @@ func (e *Executor) GdbLog() (string, error) {
 	return string(jsonOutput), nil
 }
 
-// RunSyzProgram executes a syzkaller program in the currently running VM.
-func (e *Executor) RunSyzProgram(syzProgram string) (string, error) {
+// executeSyzProgram is the internal implementation for running a syz program.
+func (e *Executor) executeSyzProgram(syzProgram string, timeout time.Duration, waitForGdb bool) (string, error) {
 	if e.activeHandle == nil || e.activeHandle.execInst == nil {
 		return "", fmt.Errorf("no active VM session. Please use 'open_vm_session' first")
 	}
-	progFile, err := os.CreateTemp("", "syz-prog-*.syz")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp program file: %w", err)
-	}
-	defer os.Remove(progFile.Name())
-	if _, err := progFile.WriteString(syzProgram); err != nil {
-		return "", fmt.Errorf("failed to write to temp program file: %w", err)
-	}
-	progFile.Close()
-
-	reproOpts, err := parseReproOptions(progFile.Name())
-	if err != nil {
-		return "", fmt.Errorf("failed to parse repro options: %w", err)
-	}
-	csOpts := buildCsourceOptions(reproOpts)
-
-	if _, err := e.activeHandle.gdbInst.Send("exec-continue"); err != nil {
-		return "", fmt.Errorf("failed to continue GDB before running program: %w", err)
-	}
-
-	go func() {
-		result, err := e.activeHandle.execInst.RunSyzProgFile(progFile.Name(), 5*time.Minute, csOpts, instance.SyzExitConditions)
-		if err != nil {
-			fmt.Printf("\n--- Background syz program execution failed: %v ---\n", err)
-			return
-		}
-		if result.Report != nil {
-			fmt.Printf("\n--- CRASH DETECTED ---\nTitle: %s\n\n%s\n--------------------\n", result.Report.Title, result.Report.Report)
-		}
-	}()
-
-	return "Syz program execution started in the background.", nil
-}
-
-// GdbSyzProgram executes a syzkaller program and waits for a GDB breakpoint or crash.
-func (e *Executor) GdbSyzProgram(syzProgram string) (string, error) {
-	if e.activeHandle == nil || e.activeHandle.execInst == nil {
-		return "", fmt.Errorf("no active VM session. Please use 'open_vm_session' first")
-	}
-	progFile, err := os.CreateTemp("", "syz-prog-*.syz")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp program file: %w", err)
-	}
-	defer os.Remove(progFile.Name())
-	if _, err := progFile.WriteString(syzProgram); err != nil {
-		return "", fmt.Errorf("failed to write to temp program file: %w", err)
-	}
-	progFile.Close()
-
-	reproOpts, err := parseReproOptions(progFile.Name())
-	if err != nil {
-		return "", fmt.Errorf("failed to parse repro options: %w", err)
-	}
-	csOpts := buildCsourceOptions(reproOpts)
 
 	e.activeHandle.mu.Lock()
-	e.activeHandle.isWaitingForGDB = true
-	e.activeHandle.pendingNotifications = nil
+	if e.activeHandle.syzProgramIsRunning {
+		e.activeHandle.mu.Unlock()
+		return "", fmt.Errorf("a syz program is already running in this session")
+	}
+	e.activeHandle.syzProgramIsRunning = true
 	e.activeHandle.mu.Unlock()
 
+	var progFile *os.File
+	var csOpts csource.Options
+	var setupErr error
+
 	defer func() {
-		e.activeHandle.mu.Lock()
-		e.activeHandle.isWaitingForGDB = false
-		e.activeHandle.pendingNotifications = nil
-		e.activeHandle.mu.Unlock()
+		if setupErr != nil {
+			e.activeHandle.mu.Lock()
+			e.activeHandle.syzProgramIsRunning = false
+			e.activeHandle.mu.Unlock()
+			if progFile != nil {
+				progFile.Close()
+				os.Remove(progFile.Name())
+			}
+		}
 	}()
 
+	progFile, setupErr = os.CreateTemp("", "syz-prog-*.syz")
+	if setupErr != nil {
+		return "", fmt.Errorf("failed to create temp program file: %w", setupErr)
+	}
+
+	if _, setupErr = progFile.WriteString(syzProgram); setupErr != nil {
+		return "", fmt.Errorf("failed to write to temp program file: %w", setupErr)
+	}
+	progFile.Close()
+
+	var reproOpts reproOpts
+	reproOpts, setupErr = parseReproOptions(progFile.Name())
+	if setupErr != nil {
+		return "", fmt.Errorf("failed to parse repro options: %w", setupErr)
+	}
+	csOpts = buildCsourceOptions(reproOpts)
+
+	if waitForGdb {
+		e.activeHandle.mu.Lock()
+		e.activeHandle.isWaitingForGDB = true
+		e.activeHandle.pendingNotifications = nil
+		e.activeHandle.mu.Unlock()
+	}
+
+	type runResult struct {
+		Result *instance.RunResult
+		Err    error
+	}
+	resultChan := make(chan runResult, 1)
+
 	go func() {
+		defer func() {
+			os.Remove(progFile.Name())
+			e.activeHandle.mu.Lock()
+			e.activeHandle.syzProgramIsRunning = false
+			e.activeHandle.mu.Unlock()
+			if err := e.activeHandle.gdbInst.Interrupt(); err != nil {
+				log.Logf(0, "failed to send interrupt to GDB after program execution: %v", err)
+			}
+		}()
 		if _, err := e.activeHandle.gdbInst.Send("exec-continue"); err != nil {
 			log.Logf(0, "failed to continue gdb in gdb_syz_program: %v", err)
+			resultChan <- runResult{Result: nil, Err: err}
 			return
 		}
-		_, err := e.activeHandle.execInst.RunSyzProgFile(progFile.Name(), 2*time.Minute, csOpts, instance.SyzExitConditions)
+		result, err := e.activeHandle.execInst.RunSyzProgFile(progFile.Name(), timeout, csOpts, instance.SyzExitConditions)
 		if err != nil {
 			log.Logf(0, "syz program execution failed in gdb_syz_program: %v", err)
 		}
+		if result != nil && result.Report != nil {
+			fmt.Printf("\n--- CRASH DETECTED ---\nTitle: %s\n\n%s\n--------------------\n", result.Report.Title, result.Report.Report)
+		}
+		resultChan <- runResult{Result: result, Err: err}
 	}()
 
-	select {
-	case <-e.activeHandle.gdbNotifications:
-		e.activeHandle.mu.Lock()
-		notifications := e.activeHandle.pendingNotifications
-		e.activeHandle.mu.Unlock()
-		jsonOutput, err := json.MarshalIndent(notifications, "", "  ")
-		if err != nil {
-			return "", fmt.Errorf("failed to marshal notifications: %w", err)
+	if !waitForGdb {
+		res := <-resultChan
+		if res.Err != nil {
+			return "", fmt.Errorf("syz program execution failed: %w", res.Err)
 		}
-		return string(jsonOutput), nil
-	case <-time.After(2 * time.Minute):
-		return "", fmt.Errorf("timed out after 2 minutes of waiting for a GDB 'stopped' notification")
+		if res.Result != nil && res.Result.Report != nil {
+			return fmt.Sprintf("Crash detected:\n%s", res.Result.Report.Report), nil
+		}
+		return "Syz program execution finished without a crash.", nil
 	}
+
+	// Wait for a 'stopped' event from GDB.
+	<-e.activeHandle.gdbNotifications
+
+	e.activeHandle.mu.Lock()
+	notifications := e.activeHandle.pendingNotifications
+	e.activeHandle.isWaitingForGDB = false
+	e.activeHandle.pendingNotifications = nil
+	e.activeHandle.mu.Unlock()
+
+	if len(notifications) == 0 {
+		return "Program finished without any GDB stop events.", nil
+	}
+
+	jsonOutput, err := json.MarshalIndent(notifications, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal notifications: %w", err)
+	}
+	return string(jsonOutput), nil
+}
+
+// RunSyzProgram executes a syzkaller program in the currently running VM.
+func (e *Executor) RunSyzProgram(syzProgram string, timeout time.Duration) (string, error) {
+	return e.executeSyzProgram(syzProgram, timeout, false)
+}
+
+// GdbSyzProgram executes a syzkaller program and waits for a GDB breakpoint or crash, with a timeout.
+func (e *Executor) GdbSyzProgram(syzProgram string, timeout time.Duration) (string, error) {
+	return e.executeSyzProgram(syzProgram, timeout, true)
 }
 
 // CloseVMSession closes the currently running VM and its associated GDB session.
@@ -301,49 +352,6 @@ func (e *Executor) CloseVMSession() (string, error) {
 	e.activeHandle.Close()
 	e.activeHandle = nil
 	return "VM session closed successfully.", nil
-}
-
-// Pahole inspects a kernel data structure's layout using 'pahole'.
-func (e *Executor) Pahole(name string) (string, error) {
-	vmlinuxPath, err := e.getVmlinuxPath()
-	if err != nil {
-		return "", err
-	}
-	kernelObj, cleanup, err := HandleFileFlag(vmlinuxPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to get local kernel object directory: %w", err)
-	}
-	defer cleanup()
-	cmd := exec.Command("pahole", name, kernelObj)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("pahole command failed: %v\nOutput: %s", err, string(output))
-	}
-	return string(output), nil
-}
-
-// Objdump gets the interleaved C source code and assembly for a function or symbol.
-func (e *Executor) Objdump(symbolName string) (string, error) {
-	vmlinuxPath, err := e.getVmlinuxPath()
-	if err != nil {
-		return "", err
-	}
-	kernelObj, cleanup, err := HandleFileFlag(vmlinuxPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to get local kernel object directory: %w", err)
-	}
-	defer cleanup()
-	args := []string{
-		"--source-comment=/*C*/", "--prefix=" + e.cfg.KernelDir, "--prefix-strip=4",
-		"--no-show-raw-insn", "--no-addresses", "--line-numbers", "--section=.text",
-		fmt.Sprintf("--disassemble=%s", symbolName), kernelObj,
-	}
-	cmd := exec.Command("objdump", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("objdump command failed: %v\nOutput: %s", err, string(output))
-	}
-	return string(output), nil
 }
 
 // --- Internal Implementation ---
@@ -363,21 +371,6 @@ func (e *Executor) checkBuildStatus() {
 	})
 }
 
-func (e *Executor) getVmlinuxPath() (string, error) {
-	e.checkBuildStatus()
-	if e.buildResult != nil && e.buildResult.Err != nil {
-		return "", fmt.Errorf("cannot run because kernel build failed: %w", e.buildResult.Err)
-	}
-	vmlinuxPath := e.cfg.KernelCheckout
-	if e.buildResult != nil && e.buildResult.VmlinuxPath != "" {
-		vmlinuxPath = e.buildResult.VmlinuxPath
-	}
-	if vmlinuxPath == "" {
-		return "", fmt.Errorf("vmlinux path is not available")
-	}
-	return vmlinuxPath, nil
-}
-
 type programHandle struct {
 	execInst             *instance.ExecProgInstance
 	pool                 *vm.Pool
@@ -387,6 +380,7 @@ type programHandle struct {
 	gdbNotifications     chan map[string]interface{}
 	isWaitingForGDB      bool
 	isCapturingForCmd    bool
+	syzProgramIsRunning  bool
 	mu                   sync.Mutex
 	pendingNotifications []map[string]interface{}
 	cmdNotifications     []map[string]interface{}
