@@ -108,17 +108,11 @@ func main() {
 	}
 	fmt.Printf("\nSuccess! Kernel is ready at: %s\n", kernelRepo.Dir)
 
-	// Asynchronously build the cscope database.
-	cscopeReadyChan := make(chan *CscopeProvider, 1)
-	go func() {
-		defer close(cscopeReadyChan)
-		provider, err := NewCscopeProvider(kernelRepo.Dir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Async cscope build failed: %v\n", err)
-			return
-		}
-		cscopeReadyChan <- provider
-	}()
+	// Build the cscope database synchronously.
+	cscopeProvider, err := NewCscopeProvider(kernelRepo.Dir)
+	if err != nil {
+		tool.Failf("Failed to build cscope database: %v", err)
+	}
 
 	var buildResultChan chan *BuildResult
 	if *flagBuildKernel {
@@ -136,7 +130,8 @@ func main() {
 		tool.Failf("Failed to create GenAI client: %v", err)
 	}
 
-	toolSet := initializeTools(kernelRepo.Dir, crashReport, syzReproducer, buildResultChan, cscopeReadyChan)
+	weggliProvider := &WeggliProvider{kernelDir: kernelRepo.Dir}
+	toolSet := initializeTools(kernelRepo.Dir, crashReport, syzReproducer, cscopeProvider, weggliProvider, buildResultChan)
 	agent := NewAgent(client, toolSet)
 
 	for _, rawPrompt := range flagPrompts {

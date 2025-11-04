@@ -12,10 +12,11 @@ import (
 
 // Agent manages a conversation with the GenAI model.
 type Agent struct {
-	client  *genai.Client
-	toolSet *ToolSet
-	history []*genai.Content
-	config  *genai.GenerateContentConfig
+	client            *genai.Client
+	toolSet           *ToolSet
+	history           []*genai.Content
+	config            *genai.GenerateContentConfig
+	currentAgentClass string
 }
 
 // NewAgent creates a new conversation agent.
@@ -39,6 +40,7 @@ func NewAgent(client *genai.Client, toolSet *ToolSet) *Agent {
 func (a *Agent) RunPrompt(ctx context.Context, rawPrompt string) (string, error) {
 	// Prepare the tool configuration for this specific prompt.
 	agentClass, prompt := parsePrompt(rawPrompt)
+	a.currentAgentClass = agentClass
 	var tools *genai.Tool
 	if agentClass != "" {
 		fmt.Printf("--- Using agent class: %s ---\n", agentClass)
@@ -121,7 +123,7 @@ func (a *Agent) processResponse(resp *genai.GenerateContentResponse) (string, bo
 			continue
 		}
 		if part.FunctionCall != nil {
-			funcResponse, err = a.toolSet.Handle(part.FunctionCall)
+			funcResponse, err = a.toolSet.Handle(a.currentAgentClass, part.FunctionCall)
 			if err != nil {
 				return "", false, fmt.Errorf("error handling function call '%s': %w", part.FunctionCall.Name, err)
 			}

@@ -16,7 +16,7 @@ import (
 const maxOutputSize = 500000 // Limit output to 500k characters
 
 // ToolHandler defines the function signature for handling a tool's function call.
-type ToolHandler func(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error)
+type ToolHandler func(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error)
 
 // Tool represents a single function that the agent can call.
 type Tool struct {
@@ -72,14 +72,14 @@ func (ts *ToolSet) GetToolConfigForClass(class string) *genai.Tool {
 }
 
 // Handle dispatches a function call to the appropriate tool's handler and logs the interaction.
-func (ts *ToolSet) Handle(fc *genai.FunctionCall) (*genai.Part, error) {
+func (ts *ToolSet) Handle(agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	tool, ok := ts.tools[fc.Name]
 	if !ok {
 		return nil, fmt.Errorf("unknown tool function: %s", fc.Name)
 	}
 
 	logFunctionCall(fc.Name, fc)
-	part, err := tool.Handler(ts, fc)
+	part, err := tool.Handler(ts, agentClass, fc)
 	if err != nil {
 		return nil, err
 	}
@@ -97,25 +97,25 @@ func (ts *ToolSet) Handle(fc *genai.FunctionCall) (*genai.Part, error) {
 
 // Tools provides a unified set of tools for the agent.
 type Tools struct {
-	kernelDir       string
-	kernelObj       string
-	report          string
-	reproducer      string
-	fnProviders     []FunctionProvider
-	cscopeProvider  *CscopeProvider
-	cscopeReadyChan <-chan *CscopeProvider
-	executor        *Executor
+	kernelDir      string
+	kernelObj      string
+	report         string
+	reproducer     string
+	cscopeProvider *CscopeProvider
+	weggliProvider *WeggliProvider
+	executor       *Executor
 }
 
 // NewTools creates a new Tools provider.
-func NewTools(kernelDir, kernelObj, report, reproducer string, executor *Executor, cscopeReadyChan <-chan *CscopeProvider) *Tools {
+func NewTools(kernelDir, kernelObj, report, reproducer string, cscopeProvider *CscopeProvider, weggliProvider *WeggliProvider, executor *Executor) *Tools {
 	return &Tools{
-		kernelDir:       kernelDir,
-		kernelObj:       kernelObj,
-		report:          report,
-		reproducer:      reproducer,
-		executor:        executor,
-		cscopeReadyChan: cscopeReadyChan,
+		kernelDir:      kernelDir,
+		kernelObj:      kernelObj,
+		report:         report,
+		reproducer:     reproducer,
+		cscopeProvider: cscopeProvider,
+		weggliProvider: weggliProvider,
+		executor:       executor,
 	}
 }
 
@@ -162,6 +162,48 @@ func (at *Tools) GetTools() []*Tool {
 			},
 			Handler: at.handleGetFileLines,
 			Classes: []string{"crash_analyzer", "code_explorer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "read_playbook", Description: "Reads a section from the agent's analysis playbook. If 'section' is empty, it returns the index.",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+					"section": {Type: genai.TypeString, Description: "The name of the section file to read (e.g., '1_initial_triage.md')."},
+				}},
+			},
+			Handler: at.handleReadPlaybook,
+			Classes: []string{"crash_analyzer", "code_explorer", "executor"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "find_struct_allocations", Description: "Finds allocations of a given C structure variable in the kernel source code. Example: struct my_struct *var; var = kmalloc(...);",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"struct_name": {Type: genai.TypeString, Description: "The name of the structure to find allocations for."}}, Required: []string{"struct_name"}},
+			},
+			Handler: at.handleFindStructAllocations,
+			Classes: []string{"code_explorer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "find_field_allocations", Description: "Finds allocations assigned to a specific struct field. Example: some_struct->field = kmalloc(...);",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"field_name": {Type: genai.TypeString, Description: "The name of the struct field being allocated."}}, Required: []string{"field_name"}},
+			},
+			Handler: at.handleFindFieldAllocations,
+			Classes: []string{"code_explorer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "find_struct_frees", Description: "Finds frees of a pointer variable of a given struct type. Example: struct my_struct *var; kfree(var);",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"struct_name": {Type: genai.TypeString, Description: "The name of the struct type for the pointer being freed."}}, Required: []string{"struct_name"}},
+			},
+			Handler: at.handleFindStructFrees,
+			Classes: []string{"code_explorer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
+				Name: "find_field_frees", Description: "Finds frees of a specific struct field. Example: kfree(some_struct->field);",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"field_name": {Type: genai.TypeString, Description: "The name of the struct field being freed."}}, Required: []string{"field_name"}},
+			},
+			Handler: at.handleFindFieldFrees,
+			Classes: []string{"code_explorer"},
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
@@ -247,30 +289,65 @@ func (at *Tools) createResponse(name, output string, err error) *genai.Part {
 	return &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: name, Response: response}}
 }
 
-func (at *Tools) handleGetCrashContext(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+// --- Tool Handlers ---
+
+func (at *Tools) handleGetCrashContext(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	contextText := fmt.Sprintf("--- Crash Report ---\n%s\n\n--- Syz-Reproducer ---\n%s", at.report, at.reproducer)
 	return at.createResponse("get_crash_context", contextText, nil), nil
 }
 
-func (at *Tools) handleGitGrep(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handleGitGrep(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	searchTerm, _ := fc.Args["search_term"].(string)
 	output, err := at.executeGitGrep(searchTerm)
 	return at.createResponse("git_grep", output, err), nil
 }
 
-func (at *Tools) handleGetFunctionDefinition(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handleGetFunctionDefinition(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	functionName, _ := fc.Args["function_name"].(string)
-	output, err := at.findFunctionDefinition(functionName)
+	output, err := at.cscopeProvider.FindFunctionDefinition(functionName)
 	return at.createResponse("get_function_definition", output, err), nil
 }
 
-func (at *Tools) handleFindFunctionCalls(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handleFindFunctionCalls(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	functionName, _ := fc.Args["function_name"].(string)
-	output, err := at.findFunctionCalls(functionName)
+	output, err := at.cscopeProvider.FindFunctionCalls(functionName)
 	return at.createResponse("find_function_calls", output, err), nil
 }
 
-func (at *Tools) handleGetFileLines(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handleReadPlaybook(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	if agentClass == "" {
+		return nil, fmt.Errorf("read_playbook can only be used by a specific agent class")
+	}
+	section, _ := fc.Args["section"].(string)
+	output, err := at.executeReadPlaybook(agentClass, section)
+	return at.createResponse("read_playbook", output, err), nil
+}
+
+func (at *Tools) handleFindStructAllocations(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	structName, _ := fc.Args["struct_name"].(string)
+	output, err := at.weggliProvider.FindStructAllocations(structName)
+	return at.createResponse("find_struct_allocations", output, err), nil
+}
+
+func (at *Tools) handleFindFieldAllocations(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	fieldName, _ := fc.Args["field_name"].(string)
+	output, err := at.weggliProvider.FindFieldAllocations(fieldName)
+	return at.createResponse("find_field_allocations", output, err), nil
+}
+
+func (at *Tools) handleFindStructFrees(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	structName, _ := fc.Args["struct_name"].(string)
+	output, err := at.weggliProvider.FindStructFrees(structName)
+	return at.createResponse("find_struct_frees", output, err), nil
+}
+
+func (at *Tools) handleFindFieldFrees(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	fieldName, _ := fc.Args["field_name"].(string)
+	output, err := at.weggliProvider.FindFieldFrees(fieldName)
+	return at.createResponse("find_field_frees", output, err), nil
+}
+
+func (at *Tools) handleGetFileLines(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	filePath, _ := fc.Args["file_path"].(string)
 	startLine, _ := fc.Args["start_line"].(float64)
 	endLine, _ := fc.Args["end_line"].(float64)
@@ -278,71 +355,70 @@ func (at *Tools) handleGetFileLines(ts *ToolSet, fc *genai.FunctionCall) (*genai
 	return at.createResponse("get_file_lines", output, err), nil
 }
 
-func (at *Tools) handleOpenVMSession(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	output, err := at.executor.OpenVMSession()
-	return at.createResponse("open_vm_session", output, err), nil
-}
-
-func (at *Tools) handleRunSyzProgram(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	syzProgram, _ := fc.Args["syz_program"].(string)
-	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
-	if !ok {
-		timeoutSec = 300 // Default to 5 minutes
-	}
-	timeout := time.Duration(timeoutSec) * time.Second
-	output, err := at.executor.RunSyzProgram(syzProgram, timeout)
-	return at.createResponse("run_syz_program", output, err), nil
-}
-
-func (at *Tools) handleGdbSyzProgram(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	syzProgram, _ := fc.Args["syz_program"].(string)
-	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
-	if !ok {
-		timeoutSec = 120 // Default to 2 minutes
-	}
-	timeout := time.Duration(timeoutSec) * time.Second
-	output, err := at.executor.GdbSyzProgram(syzProgram, timeout)
-	return at.createResponse("gdb_syz_program", output, err), nil
-}
-
-func (at *Tools) handleGdbCommand(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	command, _ := fc.Args["command"].(string)
-	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
-	if !ok {
-		timeoutSec = 60 // Default to 1 minute
-	}
-	timeout := time.Duration(timeoutSec) * time.Second
-	output, err := at.executor.GdbCommand(command, timeout)
-	return at.createResponse("gdb_command", output, err), nil
-}
-
-func (at *Tools) handleGdbLog(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	output, err := at.executor.GdbLog()
-	response := map[string]any{}
-	if err != nil {
-		response["error"] = err.Error()
-	} else {
-		response["log"] = output
-	}
-	return &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: "gdb_log", Response: response}}, nil
-}
-
-func (at *Tools) handleCloseVMSession(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
-	output, err := at.executor.CloseVMSession()
-	return at.createResponse("close_vm_session", output, err), nil
-}
-
-func (at *Tools) handlePahole(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handlePahole(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	name, _ := fc.Args["name"].(string)
 	output, err := at.executePahole(name)
 	return at.createResponse("pahole", output, err), nil
 }
 
-func (at *Tools) handleObjdump(ts *ToolSet, fc *genai.FunctionCall) (*genai.Part, error) {
+func (at *Tools) handleObjdump(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	symbolName, _ := fc.Args["symbol_name"].(string)
 	output, err := at.executeObjdump(symbolName)
 	return at.createResponse("objdump", output, err), nil
 }
+
+func (at *Tools) handleOpenVMSession(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	output, err := at.executor.OpenVMSession()
+	return at.createResponse("open_vm_session", output, err), nil
+}
+
+func (at *Tools) handleRunSyzProgram(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	syzProgram, _ := fc.Args["syz_program"].(string)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 300 // Default
+	}
+	output, err := at.executor.RunSyzProgram(syzProgram, time.Duration(timeoutSec)*time.Second)
+	return at.createResponse("run_syz_program", output, err), nil
+}
+
+func (at *Tools) handleGdbSyzProgram(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	syzProgram, _ := fc.Args["syz_program"].(string)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 120 // Default
+	}
+	output, err := at.executor.GdbSyzProgram(syzProgram, time.Duration(timeoutSec)*time.Second)
+	return at.createResponse("gdb_syz_program", output, err), nil
+}
+
+func (at *Tools) handleGdbCommand(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	command, _ := fc.Args["command"].(string)
+	timeoutSec, ok := fc.Args["timeout_seconds"].(float64)
+	if !ok {
+		timeoutSec = 60 // Default
+	}
+	output, err := at.executor.GdbCommand(command, time.Duration(timeoutSec)*time.Second)
+	return at.createResponse("gdb_command", output, err), nil
+}
+
+func (at *Tools) handleGdbLog(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	output, err := at.executor.GdbLog()
+	response := map[string]any{}
+	if err != nil {
+		response["error"] = err.Error()
+	} else {
+		response["log"] = output // gdb_log has a different response structure
+	}
+	return &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: "gdb_log", Response: response}}, nil
+}
+
+func (at *Tools) handleCloseVMSession(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	output, err := at.executor.CloseVMSession()
+	return at.createResponse("close_vm_session", output, err), nil
+}
+
+// --- Execution Helpers ---
 
 func (at *Tools) executeGitGrep(searchTerm string) (string, error) {
 	cmd := exec.Command("git", "grep", "-W", "-p", "--break", "--heading", searchTerm, ".")
@@ -355,6 +431,44 @@ func (at *Tools) executeGitGrep(searchTerm string) (string, error) {
 		return "", fmt.Errorf("git grep command failed: %v\nOutput: %s", err, string(output))
 	}
 	return string(output), nil
+}
+
+func (at *Tools) executeReadPlaybook(agentClass, section string) (string, error) {
+	playbookDir := filepath.Join("docs", "agent", agentClass)
+	if _, err := os.Stat(playbookDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("no playbook found for agent class '%s'", agentClass)
+	}
+
+	// If no section is specified, read the index file (README.md).
+	if section == "" {
+		readmePath := filepath.Join(playbookDir, "README.md")
+		content, err := os.ReadFile(readmePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read playbook index for '%s': %w", agentClass, err)
+		}
+		return string(content), nil
+	}
+
+	// A section was specified, try to read it.
+	sectionPath := filepath.Join(playbookDir, section)
+	content, err := os.ReadFile(sectionPath)
+	if err == nil {
+		return string(content), nil
+	}
+
+	// If the section file doesn't exist, fall back to the index with a warning.
+	if os.IsNotExist(err) {
+		warningMsg := fmt.Sprintf("Warning: Section '%s' not found. Returning the playbook index instead.\n\n", section)
+		readmePath := filepath.Join(playbookDir, "README.md")
+		readmeContent, readmeErr := os.ReadFile(readmePath)
+		if readmeErr != nil {
+			return "", fmt.Errorf("section '%s' not found and failed to read playbook index as fallback: %w", section, readmeErr)
+		}
+		return warningMsg + string(readmeContent), nil
+	}
+
+	// For any other type of error, return it directly.
+	return "", fmt.Errorf("failed to read playbook section '%s': %w", section, err)
 }
 
 func (at *Tools) executePahole(name string) (string, error) {
@@ -396,91 +510,6 @@ func (at *Tools) executeObjdump(symbolName string) (string, error) {
 	return string(output), nil
 }
 
-func (at *Tools) checkCscope() {
-	if at.cscopeProvider == nil {
-		select {
-		case provider, ok := <-at.cscopeReadyChan:
-			if ok && provider != nil {
-				fmt.Println("--- Cscope provider is now ready. ---")
-				at.cscopeProvider = provider
-			}
-		default:
-			// Cscope is not ready, do nothing.
-		}
-	}
-}
-
-func (at *Tools) findFunctionDefinition(functionName string) (string, error) {
-	at.checkCscope()
-
-	// If cscope is ready, it's the preferred provider.
-	if at.cscopeProvider != nil {
-		output, err := at.cscopeProvider.FindFunctionDefinition(functionName)
-		if err == nil {
-			return output, nil
-		}
-		fmt.Fprintf(os.Stderr, "cscope provider failed, trying fallbacks: %v\n", err)
-	}
-
-	// Initialize fallback providers if they don't exist.
-	if at.fnProviders == nil {
-		at.fnProviders = []FunctionProvider{
-			&WeggliProvider{kernelDir: at.kernelDir},
-			&GoELFProvider{kernelObj: at.kernelObj, kernelDir: at.kernelDir},
-			&AstGrepProvider{kernelDir: at.kernelDir},
-		}
-	}
-
-	// Try the fallback providers.
-	var lastErr error
-	for _, p := range at.fnProviders {
-		if _, ok := p.(*GoELFProvider); ok && at.kernelObj == "" {
-			continue
-		}
-		output, err := p.FindFunctionDefinition(functionName)
-		if err == nil {
-			return output, nil
-		}
-		lastErr = err
-	}
-
-	return "", fmt.Errorf("all function definition providers failed; last error: %w", lastErr)
-}
-
-func (at *Tools) findFunctionCalls(functionName string) (string, error) {
-	at.checkCscope()
-
-	// If cscope is ready, it's the preferred provider.
-	if at.cscopeProvider != nil {
-		output, err := at.cscopeProvider.FindFunctionCalls(functionName)
-		if err == nil {
-			return output, nil
-		}
-		fmt.Fprintf(os.Stderr, "cscope provider failed for calls, trying fallbacks: %v\n", err)
-	}
-
-	// Initialize fallback providers if they don't exist.
-	if at.fnProviders == nil {
-		at.fnProviders = []FunctionProvider{
-			&WeggliProvider{kernelDir: at.kernelDir},
-			&GoELFProvider{kernelObj: at.kernelObj, kernelDir: at.kernelDir},
-			&AstGrepProvider{kernelDir: at.kernelDir},
-		}
-	}
-
-	// Try the fallback providers.
-	var lastErr error
-	for _, p := range at.fnProviders {
-		output, err := p.FindFunctionCalls(functionName)
-		if err == nil {
-			return output, nil
-		}
-		lastErr = err
-	}
-
-	return "", fmt.Errorf("all function call providers failed; last error: %w", lastErr)
-}
-
 func (at *Tools) executeGetFileLines(filePath string, startLine, endLine int) (string, error) {
 	if startLine <= 0 || endLine < startLine {
 		return "", fmt.Errorf("invalid line range")
@@ -510,7 +539,7 @@ func truncateString(s string, n int) string {
 // --- Tool Initialization ---
 
 // initializeTools creates and configures all the tool providers for the agent.
-func initializeTools(kernelDir, crashReport, syzReproducer string, buildResultChan chan *BuildResult, cscopeReadyChan <-chan *CscopeProvider) *ToolSet {
+func initializeTools(kernelDir, crashReport, syzReproducer string, cscopeProvider *CscopeProvider, weggliProvider *WeggliProvider, buildResultChan chan *BuildResult) *ToolSet {
 	kernelObj := *flagKernelCheckout
 	if buildResultChan != nil {
 		res := <-buildResultChan
@@ -542,6 +571,6 @@ func initializeTools(kernelDir, crashReport, syzReproducer string, buildResultCh
 		fmt.Println("Executor disabled (kernel artifacts not provided and --build-kernel=false).")
 	}
 
-	toolProvider := NewTools(kernelDir, kernelObj, crashReport, syzReproducer, executor, cscopeReadyChan)
+	toolProvider := NewTools(kernelDir, kernelObj, crashReport, syzReproducer, cscopeProvider, weggliProvider, executor)
 	return NewToolSet(toolProvider)
 }
