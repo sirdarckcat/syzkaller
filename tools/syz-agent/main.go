@@ -134,13 +134,34 @@ func main() {
 	toolSet := initializeTools(kernelRepo.Dir, crashReport, syzReproducer, cscopeProvider, weggliProvider, buildResultChan)
 	agent := NewAgent(client, toolSet)
 
-	for _, rawPrompt := range flagPrompts {
+	for _, p := range flagPrompts {
+		rawPrompt := p
+		// If a prompt starts with @, treat it as a file path and read the content.
+		if strings.HasPrefix(p, "@") {
+			filePath := strings.TrimPrefix(p, "@")
+			content, err := os.ReadFile(filePath)
+			if err != nil {
+				tool.Failf("failed to read prompt file %s: %v", filePath, err)
+			}
+			rawPrompt = string(content)
+		} else if strings.Contains(p, ":@") {
+			parts := strings.SplitN(p, ":@", 2)
+			if len(parts) == 2 {
+				agentClass, filePath := parts[0], parts[1]
+				content, err := os.ReadFile(filePath)
+				if err != nil {
+					tool.Failf("failed to read prompt file %s: %v", filePath, err)
+				}
+				rawPrompt = fmt.Sprintf("%s: %s", agentClass, string(content))
+			}
+		}
+
 		finalResponse, err := agent.RunPrompt(ctx, rawPrompt)
 		if err != nil {
-			tool.Failf("Error in agent conversation for prompt '%s': %v", rawPrompt, err)
+			tool.Failf("Error in agent conversation for prompt '%s': %v", p, err)
 		}
-		_, prompt := parsePrompt(rawPrompt)
-		fmt.Printf("\n--- Agent's Final Response for: '%s' ---\n", prompt)
+		_, promptText := parsePrompt(p)
+		fmt.Printf("\n--- Agent's Final Response for: '%s' ---\n", promptText)
 		fmt.Println(finalResponse)
 		fmt.Println(strings.Repeat("=", 80))
 	}

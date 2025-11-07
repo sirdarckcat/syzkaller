@@ -137,6 +137,17 @@ func (at *Tools) GetTools() []*Tool {
 		},
 		{
 			Declaration: genai.FunctionDeclaration{
+				Name: "get_function_git_log", Description: "Retrieves the git log for a specific function within a file, showing its evolution.",
+				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{
+					"function_name": {Type: genai.TypeString, Description: "The name of the function."},
+					"file_path":     {Type: genai.TypeString, Description: "The relative path to the file containing the function."},
+				}, Required: []string{"function_name", "file_path"}},
+			},
+			Handler: at.handleGetFunctionGitLog,
+			Classes: []string{"code_explorer", "crash_analyzer"},
+		},
+		{
+			Declaration: genai.FunctionDeclaration{
 				Name: "get_function_definition", Description: "Finds the definition of a C function in the kernel source code.",
 				Parameters: &genai.Schema{Type: genai.TypeObject, Properties: map[string]*genai.Schema{"function_name": {Type: genai.TypeString, Description: "The name of the function to find."}}, Required: []string{"function_name"}},
 			},
@@ -302,6 +313,13 @@ func (at *Tools) handleGitGrep(ts *ToolSet, agentClass string, fc *genai.Functio
 	return at.createResponse("git_grep", output, err), nil
 }
 
+func (at *Tools) handleGetFunctionGitLog(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
+	functionName, _ := fc.Args["function_name"].(string)
+	filePath, _ := fc.Args["file_path"].(string)
+	output, err := at.executeGetFunctionGitLog(functionName, filePath)
+	return at.createResponse("get_function_git_log", output, err), nil
+}
+
 func (at *Tools) handleGetFunctionDefinition(ts *ToolSet, agentClass string, fc *genai.FunctionCall) (*genai.Part, error) {
 	functionName, _ := fc.Args["function_name"].(string)
 	output, err := at.cscopeProvider.FindFunctionDefinition(functionName)
@@ -433,6 +451,20 @@ func (at *Tools) executeGitGrep(searchTerm string) (string, error) {
 	return string(output), nil
 }
 
+func (at *Tools) executeGetFunctionGitLog(functionName, filePath string) (string, error) {
+	lArg := fmt.Sprintf(":%s:%s", functionName, filePath)
+	cmd := exec.Command("git", "log", "-L", lArg)
+	cmd.Dir = at.kernelDir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git log -L command failed: %v\nOutput: %s", err, string(output))
+	}
+	if len(strings.TrimSpace(string(output))) == 0 {
+		return fmt.Sprintf("No git log found for function '%s' in file '%s'.", functionName, filePath), nil
+	}
+	return string(output), nil
+}
+
 func (at *Tools) executeReadPlaybook(agentClass, section string) (string, error) {
 	playbookDir := filepath.Join("docs", "agent", agentClass)
 	if _, err := os.Stat(playbookDir); os.IsNotExist(err) {
@@ -480,7 +512,7 @@ func (at *Tools) executePahole(name string) (string, error) {
 		return "", fmt.Errorf("failed to get local kernel object directory: %w", err)
 	}
 	defer cleanup()
-	cmd := exec.Command("pahole", name, kernelObj)
+	cmd := exec.Command("pahole", "-C", name, kernelObj)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("pahole command failed: %v\nOutput: %s", err, string(output))
@@ -526,7 +558,12 @@ func (at *Tools) executeGetFileLines(filePath string, startLine, endLine int) (s
 	if endLine > len(lines) {
 		endLine = len(lines)
 	}
-	return strings.Join(lines[startLine-1:endLine], "\n"), nil
+	var result strings.Builder
+	result.WriteString(filePath + "\n")
+	for i := startLine - 1; i < endLine; i++ {
+		result.WriteString(fmt.Sprintf("%d | %s\n", i+1, lines[i]))
+	}
+	return result.String(), nil
 }
 
 func truncateString(s string, n int) string {

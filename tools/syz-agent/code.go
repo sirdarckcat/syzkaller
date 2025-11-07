@@ -163,14 +163,19 @@ func (p *CscopeProvider) FindFunctionDefinition(functionName string) (string, er
 			endLineNum = len(lines) // Fallback if closing brace isn't found
 		}
 
-		allDefinitions = append(allDefinitions, strings.Join(lines[startLineNum-1:endLineNum], "\n"))
+		var definitionWithLines strings.Builder
+		definitionWithLines.WriteString(filePath + "\n")
+		for i := startLineNum - 1; i < endLineNum; i++ {
+			definitionWithLines.WriteString(fmt.Sprintf("%d | %s\n", i+1, lines[i]))
+		}
+		allDefinitions = append(allDefinitions, definitionWithLines.String())
 	}
 
 	if !foundResults {
 		return "", fmt.Errorf("cscope found no definition for function '%s'", functionName)
 	}
 
-	return strings.Join(allDefinitions, "\n\n---\n\n"), nil
+	return strings.Join(allDefinitions, "\n---\n\n"), nil
 }
 
 // FindFunctionCalls finds all call sites for a function using cscope.
